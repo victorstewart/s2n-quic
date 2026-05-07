@@ -712,7 +712,9 @@
   },
   "handshakecorruption": {
     "aioquic": [],
-    "kwik": [],
+    "kwik": [
+      "client"
+    ],
     "lsquic": [],
     "msquic": [],
     "mvfst": [],
@@ -738,7 +740,10 @@
       "client",
       "server"
     ],
-    "xquic": []
+    "xquic": [],
+    "quinn": [
+      "server"
+    ]
   },
   "transfercorruption": {
     "aioquic": [
@@ -810,7 +815,9 @@
       "client",
       "server"
     ],
-    "kwik": [],
+    "kwik": [
+      "client"
+    ],
     "lsquic": [
       "client",
       "server"
@@ -861,7 +868,9 @@
       "client",
       "server"
     ],
-    "kwik": [],
+    "kwik": [
+      "client"
+    ],
     "lsquic": [
       "client",
       "server"
