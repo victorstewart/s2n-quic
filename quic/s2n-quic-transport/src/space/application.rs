@@ -36,6 +36,7 @@ use s2n_quic_core::{
         encoding::{PacketEncoder, PacketEncodingError},
         number::{PacketNumber, PacketNumberRange, PacketNumberSpace, SlidingWindow},
         short::{CleartextShort, ProtectedShort, Short, SpinBit},
+        zero_rtt::{CleartextZeroRtt, ProtectedZeroRtt, ZeroRtt},
     },
     random::Generator,
     recovery::MAX_BURST_PACKETS,
@@ -45,6 +46,26 @@ use s2n_quic_core::{
 
 // Ensure there is a gap between skipped packet numbers
 const MIN_SKIP_COUNTER_VALUE: u32 = MAX_BURST_PACKETS * 3;
+
+type OneRttKey<Config> =
+    <<<Config as endpoint::Config>::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttKey;
+type OneRttHeaderKey<Config> =
+    <<<Config as endpoint::Config>::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttHeaderKey;
+type ZeroRttKey<Config> =
+    <<<Config as endpoint::Config>::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::ZeroRttKey;
+type ZeroRttHeaderKey<Config> =
+    <<<Config as endpoint::Config>::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::ZeroRttHeaderKey;
+
+enum ApplicationProtection<Config: endpoint::Config> {
+    ZeroRtt {
+        key: ZeroRttKey<Config>,
+        header_key: ZeroRttHeaderKey<Config>,
+    },
+    OneRtt {
+        key_set: KeySet<OneRttKey<Config>>,
+        header_key: OneRttHeaderKey<Config>,
+    },
+}
 
 pub struct ApplicationSpace<Config: endpoint::Config> {
     /// Transmission Packet numbers
@@ -65,9 +86,7 @@ pub struct ApplicationSpace<Config: endpoint::Config> {
     //# An endpoint MUST NOT initiate a key update prior to having confirmed
     //# the handshake (Section 4.1.2).
     /// The crypto suite for application data
-    /// TODO: What about ZeroRtt?
-    key_set: KeySet<<<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttKey>,
-    header_key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttHeaderKey,
+    protection: ApplicationProtection<Config>,
 
     ping: flag::Ping,
     keep_alive: KeepAlive,
@@ -97,8 +116,8 @@ impl<Config: endpoint::Config> fmt::Debug for ApplicationSpace<Config> {
 
 impl<Config: endpoint::Config> ApplicationSpace<Config> {
     pub fn new(
-        key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttKey,
-        header_key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttHeaderKey,
+        key: OneRttKey<Config>,
+        header_key: OneRttHeaderKey<Config>,
         now: Timestamp,
         stream_manager: Config::StreamManager,
         ack_manager: AckManager,
@@ -114,8 +133,10 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
             spin_bit: SpinBit::Zero,
             stream_manager,
             crypto_stream: CryptoStream::new(),
-            key_set,
-            header_key,
+            protection: ApplicationProtection::OneRtt {
+                key_set,
+                header_key,
+            },
             ping: flag::Ping::default(),
             keep_alive,
             processed_packet_numbers: SlidingWindow::default(),
@@ -125,6 +146,45 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
             skip_counter: None,
             buffer_crypto_frames: Config::ENDPOINT_TYPE.is_client(),
         }
+    }
+
+    pub fn new_zero_rtt(
+        key: ZeroRttKey<Config>,
+        header_key: ZeroRttHeaderKey<Config>,
+        now: Timestamp,
+        stream_manager: Config::StreamManager,
+        ack_manager: AckManager,
+        keep_alive: KeepAlive,
+        datagram_manager: datagram::Manager<Config>,
+        dc_manager: dc::Manager<Config>,
+    ) -> Self {
+        Self {
+            tx_packet_numbers: TxPacketNumbers::new(PacketNumberSpace::ApplicationData, now),
+            ack_manager,
+            spin_bit: SpinBit::Zero,
+            stream_manager,
+            crypto_stream: CryptoStream::new(),
+            protection: ApplicationProtection::ZeroRtt { key, header_key },
+            ping: flag::Ping::default(),
+            keep_alive,
+            processed_packet_numbers: SlidingWindow::default(),
+            recovery_manager: recovery::Manager::new(PacketNumberSpace::ApplicationData),
+            datagram_manager,
+            dc_manager,
+            skip_counter: None,
+            buffer_crypto_frames: Config::ENDPOINT_TYPE.is_client(),
+        }
+    }
+
+    pub fn install_one_rtt_keys(
+        &mut self,
+        key: OneRttKey<Config>,
+        header_key: OneRttHeaderKey<Config>,
+    ) {
+        self.protection = ApplicationProtection::OneRtt {
+            key_set: KeySet::new(key, Self::key_limits()),
+            header_key,
+        };
     }
 
     /// Returns true if the packet number has already been processed
@@ -203,6 +263,7 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
         let mut outcome = transmission::Outcome::default();
 
         let destination_connection_id = context.path().peer_connection_id;
+        let source_connection_id = context.path_manager[context.path_id].local_connection_id;
         let transmission_mode = context.transmission_mode;
         let min_packet_len = context.min_packet_len;
         let bytes_progressed = self.stream_manager.outgoing_bytes_progressed();
@@ -235,25 +296,52 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
         };
 
         let spin_bit = self.spin_bit;
-        let header_key = &self.header_key;
-        let (_protected_packet, buffer) =
-            self.key_set
-                .encrypt_packet(buffer, |buffer, key, key_phase| {
-                    let packet = Short {
-                        spin_bit,
-                        key_phase,
-                        destination_connection_id,
-                        packet_number,
-                        payload,
-                    };
-                    packet.encode_packet(
-                        key,
-                        header_key,
-                        packet_number_encoder,
-                        min_packet_len,
-                        buffer,
-                    )
-                })?;
+        let (buffer, sent_zero_rtt) = match &mut self.protection {
+            ApplicationProtection::OneRtt {
+                key_set,
+                header_key,
+            } => {
+                let (_protected_packet, buffer) =
+                    key_set.encrypt_packet(buffer, |buffer, key, key_phase| {
+                        let packet = Short {
+                            spin_bit,
+                            key_phase,
+                            destination_connection_id,
+                            packet_number,
+                            payload,
+                        };
+                        packet.encode_packet(
+                            key,
+                            header_key,
+                            packet_number_encoder,
+                            min_packet_len,
+                            buffer,
+                        )
+                    })?;
+                (buffer, false)
+            }
+            ApplicationProtection::ZeroRtt { key, header_key } => {
+                if Config::ENDPOINT_TYPE.is_server() {
+                    return Err(PacketEncodingError::EmptyPayload(buffer));
+                }
+
+                let packet = ZeroRtt {
+                    version: context.quic_version,
+                    destination_connection_id,
+                    source_connection_id,
+                    packet_number,
+                    payload,
+                };
+                let (_protected_packet, buffer) = packet.encode_packet(
+                    key,
+                    header_key,
+                    packet_number_encoder,
+                    min_packet_len,
+                    buffer,
+                )?;
+                (buffer, true)
+            }
+        };
 
         outcome.bytes_progressed +=
             (self.stream_manager.outgoing_bytes_progressed() - bytes_progressed).as_u64() as usize;
@@ -264,6 +352,7 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
             outcome,
             handshake_status,
             skipped_packet_number,
+            sent_zero_rtt,
         );
 
         Ok((outcome, buffer))
@@ -276,6 +365,7 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
         outcome: transmission::Outcome,
         handshake_status: &mut HandshakeStatus,
         skipped_packet_number: SkippedPacketNumber,
+        sent_zero_rtt: bool,
     ) {
         let app_limited = self.is_app_limited(context.path(), outcome.bytes_sent);
 
@@ -309,10 +399,17 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
         context
             .publisher
             .on_packet_sent(event::builder::PacketSent {
-                packet_header: event::builder::PacketHeader::new(
-                    packet_number,
-                    context.publisher.quic_version(),
-                ),
+                packet_header: if sent_zero_rtt {
+                    event::builder::PacketHeader::ZeroRtt {
+                        number: packet_number.as_u64(),
+                        version: context.publisher.quic_version(),
+                    }
+                } else {
+                    event::builder::PacketHeader::new(
+                        packet_number,
+                        context.publisher.quic_version(),
+                    )
+                },
                 packet_len: outcome.bytes_sent,
                 transmission_mode: context.transmission_mode.into_event(),
             });
@@ -394,25 +491,30 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
 
         let spin_bit = self.spin_bit;
         let min_packet_len = context.min_packet_len;
-        let header_key = &self.header_key;
+        let ApplicationProtection::OneRtt {
+            key_set,
+            header_key,
+        } = &mut self.protection
+        else {
+            return Err(PacketEncodingError::EmptyPayload(buffer));
+        };
         let (_protected_packet, buffer) =
-            self.key_set
-                .encrypt_packet(buffer, |buffer, key, key_phase| {
-                    let packet = Short {
-                        spin_bit,
-                        key_phase,
-                        destination_connection_id,
-                        packet_number,
-                        payload,
-                    };
-                    packet.encode_packet(
-                        key,
-                        header_key,
-                        packet_number_encoder,
-                        min_packet_len,
-                        buffer,
-                    )
-                })?;
+            key_set.encrypt_packet(buffer, |buffer, key, key_phase| {
+                let packet = Short {
+                    spin_bit,
+                    key_phase,
+                    destination_connection_id,
+                    packet_number,
+                    payload,
+                };
+                packet.encode_packet(
+                    key,
+                    header_key,
+                    packet_number_encoder,
+                    min_packet_len,
+                    buffer,
+                )
+            })?;
 
         context
             .publisher
@@ -468,7 +570,9 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
         publisher: &mut Pub,
     ) {
         self.ack_manager.on_timeout(timestamp);
-        self.key_set.on_timeout(timestamp);
+        if let ApplicationProtection::OneRtt { key_set, .. } = &mut self.protection {
+            key_set.on_timeout(timestamp);
+        }
 
         let (recovery_manager, mut context) = self.recovery(
             handshake_status,
@@ -598,9 +702,22 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
         path: &path::Path<Config>,
         publisher: &mut Pub,
     ) -> Result<CleartextShort<'a>, ProcessingError> {
+        let ApplicationProtection::OneRtt {
+            key_set,
+            header_key,
+        } = &mut self.protection
+        else {
+            publisher.on_packet_dropped(event::builder::PacketDropped {
+                reason: event::builder::PacketDropReason::UnprotectFailed {
+                    space: event::builder::KeySpace::OneRtt,
+                    path: path_event!(path, path_id),
+                },
+            });
+            return Err(ProcessingError::Other);
+        };
         let largest_acked = self.ack_manager.largest_received_packet_number_acked();
         let packet = protected
-            .unprotect(&self.header_key, largest_acked)
+            .unprotect(header_key, largest_acked)
             .inspect_err(|_err| {
                 publisher.on_packet_dropped(event::builder::PacketDropped {
                     reason: event::builder::PacketDropReason::UnprotectFailed {
@@ -613,7 +730,7 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
         let packet_number = packet.packet_number;
         let packet_header =
             event::builder::PacketHeader::new(packet.packet_number, publisher.quic_version());
-        let decrypted = self.key_set.decrypt_packet(
+        let decrypted = key_set.decrypt_packet(
             packet,
             largest_acked,
             //= https://www.rfc-editor.org/rfc/rfc9001#section-6.3
@@ -636,7 +753,7 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
             Ok((_, Some(generation))) => {
                 publisher.on_key_update(event::builder::KeyUpdate {
                     key_type: event::builder::KeyType::OneRtt { generation },
-                    cipher_suite: self.key_set.cipher_suite().into_event(),
+                    cipher_suite: key_set.cipher_suite().into_event(),
                 });
             }
             Ok(_) => {}
@@ -669,6 +786,62 @@ impl<Config: endpoint::Config> ApplicationSpace<Config> {
         decrypted.map(|x| x.0)
     }
 
+    pub fn validate_and_decrypt_zero_rtt_packet<'a, Pub: event::ConnectionPublisher>(
+        &mut self,
+        protected: ProtectedZeroRtt<'a>,
+        datagram: &DatagramInfo,
+        path_id: path::Id,
+        path: &path::Path<Config>,
+        publisher: &mut Pub,
+    ) -> Result<CleartextZeroRtt<'a>, ProcessingError> {
+        let ApplicationProtection::ZeroRtt { key, header_key } = &mut self.protection else {
+            publisher.on_packet_dropped(event::builder::PacketDropped {
+                reason: event::builder::PacketDropReason::UnprotectFailed {
+                    space: event::builder::KeySpace::ZeroRtt,
+                    path: path_event!(path, path_id),
+                },
+            });
+            return Err(ProcessingError::Other);
+        };
+
+        let largest_acked = self.ack_manager.largest_received_packet_number_acked();
+        let packet = protected
+            .unprotect(header_key, largest_acked)
+            .inspect_err(|_err| {
+                publisher.on_packet_dropped(event::builder::PacketDropped {
+                    reason: event::builder::PacketDropReason::UnprotectFailed {
+                        space: event::builder::KeySpace::ZeroRtt,
+                        path: path_event!(path, path_id),
+                    },
+                });
+            })?;
+
+        let packet_number = packet.packet_number;
+        let packet_header = event::builder::PacketHeader::ZeroRtt {
+            number: packet_number.as_u64(),
+            version: packet.version.into(),
+        };
+        let decrypted = packet.decrypt(key);
+        if decrypted.is_err() {
+            publisher.on_packet_dropped(event::builder::PacketDropped {
+                reason: event::builder::PacketDropReason::DecryptionFailed {
+                    packet_header,
+                    path: path_event!(path, path_id),
+                },
+            });
+        }
+
+        if self.is_duplicate(packet_number, path_id, path, publisher) {
+            return Err(ProcessingError::Other);
+        }
+
+        if decrypted.is_ok() {
+            self.keep_alive.reset(datagram.timestamp);
+        }
+
+        decrypted.map_err(|_| ProcessingError::Other)
+    }
+
     fn key_limits() -> limited::Limits {
         limited::Limits::default()
     }
@@ -679,7 +852,9 @@ impl<Config: endpoint::Config> timer::Provider for ApplicationSpace<Config> {
     fn timers<Q: timer::Query>(&self, query: &mut Q) -> timer::Result {
         self.ack_manager.timers(query)?;
         self.recovery_manager.timers(query)?;
-        self.key_set.timers(query)?;
+        if let ApplicationProtection::OneRtt { key_set, .. } = &self.protection {
+            key_set.timers(query)?;
+        }
         self.stream_manager.timers(query)?;
         self.keep_alive.timers(query)?;
 

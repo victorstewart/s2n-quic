@@ -231,6 +231,7 @@ impl connection::Trait for TestConnection {
         _path_id: path::Id,
         _packet: ProtectedZeroRtt,
         _packet_len: usize,
+        _random_generator: &mut <Self::Config as endpoint::Config>::RandomGenerator,
         _subscriber: &mut <Self::Config as endpoint::Config>::EventSubscriber,
         _packet_interceptor: &mut <Self::Config as endpoint::Config>::PacketInterceptor,
     ) -> Result<(), ProcessingError> {

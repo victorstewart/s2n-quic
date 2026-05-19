@@ -199,6 +199,7 @@ pub trait ConnectionTrait: 'static + Send + Sized {
         path_id: path::Id,
         packet: ProtectedZeroRtt,
         packet_len: usize,
+        random_generator: &mut <Self::Config as endpoint::Config>::RandomGenerator,
         subscriber: &mut <Self::Config as endpoint::Config>::EventSubscriber,
         packet_interceptor: &mut <Self::Config as endpoint::Config>::PacketInterceptor,
     ) -> Result<(), ProcessingError>;
@@ -334,6 +335,7 @@ pub trait ConnectionTrait: 'static + Send + Sized {
                 path_id,
                 packet,
                 packet_len,
+                random_generator,
                 subscriber,
                 packet_interceptor,
             ),

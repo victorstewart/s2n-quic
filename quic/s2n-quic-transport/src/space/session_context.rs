@@ -89,6 +89,7 @@ impl<Config: endpoint::Config, Pub: event::ConnectionPublisher> SessionContext<'
     fn on_server_params(
         &mut self,
         decoder: DecoderBuffer,
+        validate_connection_ids: bool,
     ) -> Result<PeerTransportParams, transport::Error> {
         debug_assert!(Config::ENDPOINT_TYPE.is_client());
 
@@ -109,75 +110,77 @@ impl<Config: endpoint::Config, Pub: event::ConnectionPublisher> SessionContext<'
             },
         );
 
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
-        //# An endpoint MUST treat the following as a connection error of type
-        //# TRANSPORT_PARAMETER_ERROR or PROTOCOL_VIOLATION:
-        self.validate_initial_source_connection_id(
-            &peer_parameters.initial_source_connection_id,
-            self.path_manager
-                .active_path()
-                .peer_connection_id
-                .as_bytes(),
-        )?;
+        if validate_connection_ids {
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+            //# An endpoint MUST treat the following as a connection error of type
+            //# TRANSPORT_PARAMETER_ERROR or PROTOCOL_VIOLATION:
+            self.validate_initial_source_connection_id(
+                &peer_parameters.initial_source_connection_id,
+                self.path_manager
+                    .active_path()
+                    .peer_connection_id
+                    .as_bytes(),
+            )?;
 
-        match (self.retry_cid, peer_parameters.retry_source_connection_id) {
-            (Some(retry_packet_value), Some(transport_params_value)) => {
-                if retry_packet_value
+            match (self.retry_cid, peer_parameters.retry_source_connection_id) {
+                (Some(retry_packet_value), Some(transport_params_value)) => {
+                    if retry_packet_value
+                        .as_bytes()
+                        .ct_eq(transport_params_value.as_bytes())
+                        .not()
+                        .into()
+                    {
+                        return Err(transport::Error::TRANSPORT_PARAMETER_ERROR
+                            .with_reason("retry_source_connection_id mismatch"));
+                    }
+                }
+                (Some(_), None) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+                    //# *  absence of the retry_source_connection_id transport parameter from
+                    //# the server after receiving a Retry packet,
+                    return Err(transport::Error::TRANSPORT_PARAMETER_ERROR.with_reason(
+                        "retry_source_connection_id transport parameter absent \
+                    after receiving a Retry packet from the server",
+                    ));
+                }
+                (None, Some(_)) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+                    //# *  presence of the retry_source_connection_id transport parameter
+                    //# when no Retry packet was received, or
+                    return Err(transport::Error::TRANSPORT_PARAMETER_ERROR.with_reason(
+                        "retry_source_connection_id transport parameter present \
+                    when no Retry packet was received",
+                    ));
+                }
+                (None, None) => {}
+            }
+
+            if let Some(peer_value) = peer_parameters.original_destination_connection_id {
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
+                //# The values provided by a peer for these transport parameters MUST
+                //# match the values that an endpoint used in the Destination and Source
+                //# Connection ID fields of Initial packets that it sent (and received,
+                //# for servers).  Endpoints MUST validate that received transport
+                //# parameters match received connection ID values.
+                if peer_value
                     .as_bytes()
-                    .ct_eq(transport_params_value.as_bytes())
+                    .ct_eq(self.initial_cid.as_bytes())
                     .not()
                     .into()
                 {
                     return Err(transport::Error::TRANSPORT_PARAMETER_ERROR
-                        .with_reason("retry_source_connection_id mismatch"));
+                        .with_reason("original_destination_connection_id mismatch"));
                 }
-            }
-            (Some(_), None) => {
+            } else {
                 //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
-                //# *  absence of the retry_source_connection_id transport parameter from
-                //# the server after receiving a Retry packet,
-                return Err(transport::Error::TRANSPORT_PARAMETER_ERROR.with_reason(
-                    "retry_source_connection_id transport parameter absent \
-                    after receiving a Retry packet from the server",
-                ));
-            }
-            (None, Some(_)) => {
-                //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
-                //# *  presence of the retry_source_connection_id transport parameter
-                //# when no Retry packet was received, or
-                return Err(transport::Error::TRANSPORT_PARAMETER_ERROR.with_reason(
-                    "retry_source_connection_id transport parameter present \
-                    when no Retry packet was received",
-                ));
-            }
-            (None, None) => {}
-        }
-
-        if let Some(peer_value) = peer_parameters.original_destination_connection_id {
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
-            //# The values provided by a peer for these transport parameters MUST
-            //# match the values that an endpoint used in the Destination and Source
-            //# Connection ID fields of Initial packets that it sent (and received,
-            //# for servers).  Endpoints MUST validate that received transport
-            //# parameters match received connection ID values.
-            if peer_value
-                .as_bytes()
-                .ct_eq(self.initial_cid.as_bytes())
-                .not()
-                .into()
-            {
+                //# An endpoint MUST treat the absence of the
+                //# initial_source_connection_id transport parameter from either endpoint
+                //# or the absence of the original_destination_connection_id transport
+                //# parameter from the server as a connection error of type
+                //# TRANSPORT_PARAMETER_ERROR.
                 return Err(transport::Error::TRANSPORT_PARAMETER_ERROR
-                    .with_reason("original_destination_connection_id mismatch"));
+                    .with_reason("missing original_destination_connection_id"));
             }
-        } else {
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.3
-            //# An endpoint MUST treat the absence of the
-            //# initial_source_connection_id transport parameter from either endpoint
-            //# or the absence of the original_destination_connection_id transport
-            //# parameter from the server as a connection error of type
-            //# TRANSPORT_PARAMETER_ERROR.
-            return Err(transport::Error::TRANSPORT_PARAMETER_ERROR
-                .with_reason("missing original_destination_connection_id"));
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3
@@ -322,90 +325,28 @@ impl<Config: endpoint::Config, Pub: event::ConnectionPublisher> SessionContext<'
 
         Ok(())
     }
-}
 
-impl<Config: endpoint::Config, Pub: event::ConnectionPublisher>
-    tls::Context<<Config::TLSEndpoint as tls::Endpoint>::Session>
-    for SessionContext<'_, Config, Pub>
-{
-    fn on_handshake_keys(
+    fn build_application_space<F>(
         &mut self,
-        key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::HandshakeKey,
-        header_key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::HandshakeHeaderKey,
-    ) -> Result<(), transport::Error> {
-        if self.handshake.is_some() {
-            return Err(transport::Error::INTERNAL_ERROR
-                .with_reason("handshake keys initialized more than once"));
-        }
-
-        // After receiving handshake keys, the initial crypto stream should be completely
-        // finished
-        if let Some(space) = self.initial.as_mut() {
-            space.crypto_stream.finish()?;
-        }
-
-        let ack_manager = AckManager::new(PacketNumberSpace::Handshake, ack::Settings::EARLY);
-
-        let cipher_suite = key.cipher_suite().into_event();
-        *self.handshake = Some(Box::new(HandshakeSpace::new(
-            key,
-            header_key,
-            self.now,
-            ack_manager,
-        )));
-        self.publisher.on_key_update(event::builder::KeyUpdate {
-            key_type: event::builder::KeyType::Handshake,
-            cipher_suite,
-        });
-        Ok(())
-    }
-
-    fn on_zero_rtt_keys(
-        &mut self,
-        key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::ZeroRttKey,
-        _header_key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::ZeroRttHeaderKey,
-        _application_parameters: tls::ApplicationParameters,
-    ) -> Result<(), transport::Error> {
-        if self.zero_rtt_crypto.is_some() {
-            return Err(transport::Error::INTERNAL_ERROR
-                .with_reason("zero rtt keys initialized more than once"));
-        }
-
-        let cipher_suite = key.cipher_suite().into_event();
-
-        // TODO: also store the header_key
-        *self.zero_rtt_crypto = Some(Box::new(key));
-
-        self.publisher.on_key_update(event::builder::KeyUpdate {
-            key_type: event::builder::KeyType::ZeroRtt,
-            cipher_suite,
-        });
-        Ok(())
-    }
-
-    fn on_one_rtt_keys(
-        &mut self,
-        key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttKey,
-        header_key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttHeaderKey,
-        application_parameters: tls::ApplicationParameters,
-    ) -> Result<(), transport::Error> {
-        if self.application.is_some() {
-            return Err(transport::Error::INTERNAL_ERROR
-                .with_reason("application keys initialized more than once"));
-        }
-
-        if Config::ENDPOINT_TYPE.is_client() {
-            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.3
-            //# Therefore, a client SHOULD discard 0-RTT keys as soon as it installs
-            //# 1-RTT keys as they have no use after that moment.
-
-            *self.zero_rtt_crypto = None;
-        }
-
+        application_parameters: ApplicationParameters<'_>,
+        validate_connection_ids: bool,
+        build: F,
+    ) -> Result<ApplicationSpace<Config>, transport::Error>
+    where
+        F: FnOnce(
+            Config::StreamManager,
+            AckManager,
+            KeepAlive,
+            datagram::Manager<Config>,
+            crate::dc::Manager<Config>,
+        ) -> ApplicationSpace<Config>,
+    {
         // Parse transport parameters
         let param_decoder = DecoderBuffer::new(application_parameters.transport_parameters);
         let peer_params = match Config::ENDPOINT_TYPE {
-            endpoint::Type::Client => self.on_server_params(param_decoder)?,
+            endpoint::Type::Client => {
+                self.on_server_params(param_decoder, validate_connection_ids)?
+            }
             endpoint::Type::Server => self.on_client_params(param_decoder)?,
         };
 
@@ -502,17 +443,129 @@ impl<Config: endpoint::Config, Pub: event::ConnectionPublisher>
             .rtt_estimator
             .on_max_ack_delay(peer_params.max_ack_delay);
 
-        let cipher_suite = key.cipher_suite().into_event();
-        *self.application = Some(Box::new(ApplicationSpace::new(
-            key,
-            header_key,
-            self.now,
+        Ok(build(
             stream_manager,
             ack_manager,
             keep_alive,
             datagram_manager,
             dc_manager,
+        ))
+    }
+}
+
+impl<Config: endpoint::Config, Pub: event::ConnectionPublisher>
+    tls::Context<<Config::TLSEndpoint as tls::Endpoint>::Session>
+    for SessionContext<'_, Config, Pub>
+{
+    fn on_handshake_keys(
+        &mut self,
+        key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::HandshakeKey,
+        header_key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::HandshakeHeaderKey,
+    ) -> Result<(), transport::Error> {
+        if self.handshake.is_some() {
+            return Err(transport::Error::INTERNAL_ERROR
+                .with_reason("handshake keys initialized more than once"));
+        }
+
+        // After receiving handshake keys, the initial crypto stream should be completely
+        // finished
+        if let Some(space) = self.initial.as_mut() {
+            space.crypto_stream.finish()?;
+        }
+
+        let ack_manager = AckManager::new(PacketNumberSpace::Handshake, ack::Settings::EARLY);
+
+        let cipher_suite = key.cipher_suite().into_event();
+        *self.handshake = Some(Box::new(HandshakeSpace::new(
+            key,
+            header_key,
+            self.now,
+            ack_manager,
         )));
+        self.publisher.on_key_update(event::builder::KeyUpdate {
+            key_type: event::builder::KeyType::Handshake,
+            cipher_suite,
+        });
+        Ok(())
+    }
+
+    fn on_zero_rtt_keys(
+        &mut self,
+        key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::ZeroRttKey,
+        header_key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::ZeroRttHeaderKey,
+        application_parameters: tls::ApplicationParameters,
+    ) -> Result<(), transport::Error> {
+        if self.application.is_some() {
+            return Err(transport::Error::INTERNAL_ERROR
+                .with_reason("zero rtt keys initialized more than once"));
+        }
+
+        let cipher_suite = key.cipher_suite().into_event();
+        let now = self.now;
+        let application = self.build_application_space(
+            application_parameters,
+            Config::ENDPOINT_TYPE.is_server(),
+            |stream_manager, ack_manager, keep_alive, datagram_manager, dc_manager| {
+                ApplicationSpace::new_zero_rtt(
+                    key,
+                    header_key,
+                    now,
+                    stream_manager,
+                    ack_manager,
+                    keep_alive,
+                    datagram_manager,
+                    dc_manager,
+                )
+            },
+        )?;
+
+        *self.zero_rtt_crypto = None;
+        *self.application = Some(Box::new(application));
+
+        self.publisher.on_key_update(event::builder::KeyUpdate {
+            key_type: event::builder::KeyType::ZeroRtt,
+            cipher_suite,
+        });
+        Ok(())
+    }
+
+    fn on_one_rtt_keys(
+        &mut self,
+        key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttKey,
+        header_key: <<Config::TLSEndpoint as tls::Endpoint>::Session as CryptoSuite>::OneRttHeaderKey,
+        application_parameters: tls::ApplicationParameters,
+    ) -> Result<(), transport::Error> {
+        if Config::ENDPOINT_TYPE.is_client() {
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.3
+            //# Therefore, a client SHOULD discard 0-RTT keys as soon as it installs
+            //# 1-RTT keys as they have no use after that moment.
+
+            *self.zero_rtt_crypto = None;
+        }
+
+        let cipher_suite = key.cipher_suite().into_event();
+        if let Some(application) = self.application.as_mut() {
+            application.install_one_rtt_keys(key, header_key);
+        } else {
+            let now = self.now;
+            let application = self.build_application_space(
+                application_parameters,
+                true,
+                |stream_manager, ack_manager, keep_alive, datagram_manager, dc_manager| {
+                    ApplicationSpace::new(
+                        key,
+                        header_key,
+                        now,
+                        stream_manager,
+                        ack_manager,
+                        keep_alive,
+                        datagram_manager,
+                        dc_manager,
+                    )
+                },
+            )?;
+            *self.application = Some(Box::new(application));
+        }
         self.publisher.on_key_update(event::builder::KeyUpdate {
             key_type: event::builder::KeyType::OneRtt { generation: 0 },
             cipher_suite,

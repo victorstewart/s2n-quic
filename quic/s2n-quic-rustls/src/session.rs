@@ -234,6 +234,36 @@ impl Session {
         }
     }
 
+    fn flush_post_handshake<C: tls::Context<Self>>(
+        &mut self,
+        context: &mut C,
+    ) -> Result<(), transport::Error> {
+        if self.tx_phase != HandshakePhase::Application {
+            return Ok(());
+        }
+
+        loop {
+            if !context.can_send_application() {
+                return Ok(());
+            }
+
+            let mut transmission_buffer = vec![];
+            let key_change = self.connection.write_hs(&mut transmission_buffer);
+
+            if key_change.is_some() {
+                return Err(tls::Error::INTERNAL_ERROR
+                    .with_reason("unexpected post-handshake key change")
+                    .into());
+            }
+
+            if transmission_buffer.is_empty() {
+                return Ok(());
+            }
+
+            context.send_application(transmission_buffer.into());
+        }
+    }
+
     fn poll_impl<C: tls::Context<Self>>(
         &mut self,
         context: &mut C,
@@ -252,11 +282,27 @@ impl Session {
             if let Some(crypto_data) = crypto_data {
                 self.receive(&crypto_data)?;
             } else if has_tried_receive {
-                return self.poll_complete_handshake(context);
+                // After the ClientHello is written, rustls can make 0-RTT keys
+                // available before any peer response is received. Surface them
+                // before returning Pending so applications can write early data.
+                if let Some(keys) = self.zero_rtt_keys() {
+                    let (key, header_key) = PacketKey::new(
+                        keys,
+                        s2n_quic_core::crypto::tls::CipherSuite::TLS_AES_128_GCM_SHA256,
+                    );
+                    context.on_zero_rtt_keys(key, header_key, self.application_parameters()?)?;
+                }
+
+                let complete = self.poll_complete_handshake(context);
+                if matches!(complete, Poll::Ready(Ok(()))) {
+                    self.flush_post_handshake(context)?;
+                }
+                return complete;
                 // If there's nothing to receive then we're done for now
             }
 
             if let Poll::Ready(()) = self.poll_complete_handshake(context)? {
+                self.flush_post_handshake(context)?;
                 return Poll::Ready(Ok(()));
             }
 
@@ -393,6 +439,21 @@ impl tls::Session for Session {
         // returning with an error
         self.emit_events(context)?;
         result
+    }
+
+    fn process_post_handshake_message<C: tls::Context<Self>>(
+        &mut self,
+        context: &mut C,
+    ) -> Result<(), transport::Error> {
+        while let Some(crypto_data) = context.receive_application(None) {
+            self.receive(&crypto_data)?;
+        }
+
+        self.flush_post_handshake(context)
+    }
+
+    fn should_discard_session(&self) -> bool {
+        false
     }
 }
 

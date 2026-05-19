@@ -323,11 +323,23 @@ impl<Config: endpoint::Config> ConnectionImpl<Config> {
         // handshake is complete so update the connection state and prepare
         // to hand it over to the application.
         if matches!(self.state, ConnectionState::Handshaking)
+            && self.accept_state == AcceptState::Handshaking
+            && space_manager.application().is_some()
+        {
+            // 0-RTT installs application stream state before the handshake is
+            // complete. Hand the connection to the application so it can submit
+            // early data while keeping the transport in the handshaking state.
+            self.accept_state = AcceptState::HandshakeCompleted;
+        }
+
+        if matches!(self.state, ConnectionState::Handshaking)
             && space_manager.is_handshake_complete()
         {
             // Move into the HandshakeCompleted state. This will signal the
             // necessary interest to hand over the connection to the application.
-            self.accept_state = AcceptState::HandshakeCompleted;
+            if self.accept_state == AcceptState::Handshaking {
+                self.accept_state = AcceptState::HandshakeCompleted;
+            }
             // Move the connection into the active state.
             self.state = ConnectionState::Active;
 
@@ -1738,28 +1750,55 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
     fn handle_zero_rtt_packet(
         &mut self,
         datagram: &DatagramInfo,
-        _path_id: path::Id,
-        _packet: ProtectedZeroRtt,
+        path_id: path::Id,
+        packet: ProtectedZeroRtt,
         packet_len: usize,
+        random_generator: &mut Config::RandomGenerator,
         subscriber: &mut Config::EventSubscriber,
-        _packet_interceptor: &mut Config::PacketInterceptor,
+        packet_interceptor: &mut Config::PacketInterceptor,
     ) -> Result<(), ProcessingError> {
         let mut publisher = self.event_context.publisher(datagram.timestamp, subscriber);
 
-        publisher.on_packet_received(event::builder::PacketReceived {
-            packet_header: event::builder::PacketHeader::ZeroRtt {
-                // FIXME: replace with PacketHeader::new when we support zero-rtt.
-                number: 0,
-                version: publisher.quic_version(),
-            },
-            packet_len,
-        });
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
-        //= type=TODO
-        //= tracking-issue=339
-        //# If the packet is a 0-RTT packet, the server MAY buffer a limited
-        //# number of these packets in anticipation of a late-arriving Initial
-        //# packet.
+        if let Some((space, handshake_status)) = self.space_manager.application_mut() {
+            let packet = space.validate_and_decrypt_zero_rtt_packet(
+                packet,
+                datagram,
+                path_id,
+                &self.path_manager[path_id],
+                &mut publisher,
+            )?;
+
+            publisher.on_packet_received(event::builder::PacketReceived {
+                packet_header: event::builder::PacketHeader::ZeroRtt {
+                    number: packet.packet_number.as_u64(),
+                    version: publisher.quic_version(),
+                },
+                packet_len,
+            });
+
+            let processed_packet = space.handle_cleartext_payload(
+                packet.packet_number,
+                packet.payload,
+                datagram,
+                path_id,
+                &mut self.path_manager,
+                handshake_status,
+                &mut self.local_id_registry,
+                random_generator,
+                &mut publisher,
+                packet_interceptor,
+            )?;
+
+            self.on_processed_packet(&processed_packet, subscriber)?;
+        } else {
+            let path = &self.path_manager[path_id];
+            publisher.on_packet_dropped(event::builder::PacketDropped {
+                reason: event::builder::PacketDropReason::PacketSpaceDoesNotExist {
+                    path: path_event!(path, path_id),
+                    packet_type: event::builder::PacketType::ZeroRtt,
+                },
+            });
+        }
 
         Ok(())
     }
