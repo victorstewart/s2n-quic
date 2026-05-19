@@ -282,7 +282,7 @@ impl<Config: endpoint::Config> ConnectionImpl<Config> {
         let mut publisher = self.event_context.publisher(timestamp, subscriber);
         let space_manager = &mut self.space_manager;
 
-        match space_manager.poll_crypto(
+        let crypto_status = space_manager.poll_crypto(
             &mut self.path_manager,
             &mut self.local_id_registry,
             &mut self.limits,
@@ -293,12 +293,7 @@ impl<Config: endpoint::Config> ConnectionImpl<Config> {
             dc,
             limits,
             random_generator,
-        ) {
-            Poll::Ready(Ok(())) => {}
-            // use `from` instead of `into` so the location is correctly captured
-            Poll::Ready(Err(err)) => return Err(connection::Error::from(err)),
-            Poll::Pending => return Ok(()),
-        }
+        );
 
         //= https://www.rfc-editor.org/rfc/rfc9000#section-7.1
         //#
@@ -330,6 +325,13 @@ impl<Config: endpoint::Config> ConnectionImpl<Config> {
             // complete. Hand the connection to the application so it can submit
             // early data while keeping the transport in the handshaking state.
             self.accept_state = AcceptState::HandshakeCompleted;
+        }
+
+        match crypto_status {
+            Poll::Ready(Ok(())) => {}
+            // use `from` instead of `into` so the location is correctly captured
+            Poll::Ready(Err(err)) => return Err(connection::Error::from(err)),
+            Poll::Pending => return Ok(()),
         }
 
         if matches!(self.state, ConnectionState::Handshaking)
